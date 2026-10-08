@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+
+# Virtual filesystem disk images
+*.img
+disk.img
+
+# Debugging
+core
+core.*
+*.log
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
