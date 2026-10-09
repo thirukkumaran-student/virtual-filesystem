@@ -289,7 +289,7 @@ int vfs_check(vfs_disk_t *disk, FILE *output)
                 );
             }
 
-            
+
             bool root_block_reference =
                 block == VFS_DATA_START &&
                 inode_number == VFS_ROOT_INODE;
