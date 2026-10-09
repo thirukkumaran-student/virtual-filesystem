@@ -715,6 +715,9 @@ int vfs_dir_add(
             disk,
             new_block,
             block) == -1) {
+        int saved_errno = errno;
+        (void)vfs_free_block(disk, new_block);
+        errno = saved_errno;
         return -1;
     }
 
@@ -725,6 +728,12 @@ int vfs_dir_add(
             disk,
             directory_inode_number,
             &directory) == -1) {
+        /*
+         * Do not free new_block here. If the inode write partially
+         * reached the image, the inode may already reference it.
+         * Keeping the block allocated avoids a possible dangling
+         * pointer. This path is still not transactional.
+         */
         return -1;
     }
 
