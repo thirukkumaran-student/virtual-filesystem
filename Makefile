@@ -25,13 +25,18 @@ $(BUILD_DIR)/vfs: $(ALL_SOURCES) $(wildcard include/*.h) | $(BUILD_DIR)
 $(BUILD_DIR)/test_%: tests/test_%.c $(CORE_SOURCES) $(wildcard include/*.h) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(CORE_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
-test: $(TEST_BINARIES)
+
+test: $(BUILD_DIR)/vfs $(TEST_BINARIES)
 	@set -e; \
 	for test_binary in $(TEST_BINARIES); do \
 		echo ""; \
 		echo "Running $$test_binary"; \
 		./$$test_binary; \
 	done
+	@echo ""; \
+	echo "Running CLI integration tests"; \
+	./tests/test_cli.sh
+
 
 clean:
 	rm -rf $(BUILD_DIR)
