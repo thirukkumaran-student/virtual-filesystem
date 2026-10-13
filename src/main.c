@@ -1,4 +1,3 @@
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "vfs_cli.h"
@@ -84,11 +83,44 @@ static void print_help(void)
     printf("  stat <name>          Display file metadata\n");
     printf("  delete <name>        Delete a regular file\n");
     printf("  check                Check filesystem consistency\n");
+    printf("  metrics              Display disk I/O and cache statistics\n");
     printf("  info                 Display filesystem information\n\n");
 
     printf("General commands:\n");
     printf("  help                 Display this help message\n");
     printf("  exit                 Close the virtual filesystem\n\n");
+}
+
+static void print_disk_metrics(const vfs_disk_t *disk)
+{
+    if (disk == NULL || !disk->is_open) {
+        fprintf(stderr, "Error: filesystem disk is not open.\n");
+        return;
+    }
+
+    const vfs_disk_stats_t *stats = &disk->stats;
+
+    uint64_t total_lookups =
+        stats->cache_hits + stats->cache_misses;
+
+    double hit_ratio = 0.0;
+
+    if (total_lookups > 0U) {
+        hit_ratio =
+            ((double)stats->cache_hits / (double)total_lookups)
+            * 100.0;
+    }
+
+    printf("\nDisk I/O and Cache Metrics\n");
+    printf("==========================\n");
+    printf("Cache capacity:    %u blocks\n", VFS_CACHE_CAPACITY);
+    printf("Logical reads:     %" PRIu64 "\n", stats->logical_reads);
+    printf("Logical writes:    %" PRIu64 "\n", stats->logical_writes);
+    printf("Physical reads:    %" PRIu64 "\n", stats->physical_reads);
+    printf("Physical writes:   %" PRIu64 "\n", stats->physical_writes);
+    printf("Cache hits:        %" PRIu64 "\n", stats->cache_hits);
+    printf("Cache misses:      %" PRIu64 "\n", stats->cache_misses);
+    printf("Cache hit ratio:   %.2f%%\n\n", hit_ratio);
 }
 
 static void print_filesystem_info(vfs_disk_t *disk)
@@ -982,8 +1014,7 @@ static int append_file_contents(
         return -1;
     }
 
-    const uint64_t maximum_size =
-        (uint64_t)VFS_INODE_DIRECT_BLOCKS * VFS_BLOCK_SIZE;
+    const uint64_t maximum_size = VFS_FILE_MAX_SIZE;
 
     size_t text_length = strlen(text);
 
@@ -1038,7 +1069,7 @@ static int read_file_contents(
         return -1;
     }
 
-    if (file.size > VFS_INODE_DIRECT_BLOCKS * (uint64_t)VFS_BLOCK_SIZE) {
+    if (file.size > VFS_FILE_MAX_SIZE) {
         errno = EFBIG;
         return -1;
     }
@@ -1321,6 +1352,16 @@ static int process_command(
             perror("Error removing directory");
         }
 
+        return 0;
+    }
+    
+    if (strcmp(command, "metrics") == 0) {
+        if (*arguments != '\0') {
+            printf("Usage: metrics\n");
+            return 0;
+        }
+
+        print_disk_metrics(disk);
         return 0;
     }
 

@@ -113,11 +113,107 @@ int main(void)
 
     result = vfs_disk_read_block(&disk, 100, read_buffer);
 
+    
+    /*
+     * Test 13: Verify write-through cache counters.
+     * Block 100 was written and then read. The read should
+     * have been served from the cache.
+     */
+    CHECK(
+        disk.stats.logical_writes == 1U &&
+        disk.stats.physical_writes == 1U &&
+        disk.stats.logical_reads == 1U &&
+        disk.stats.physical_reads == 0U &&
+        disk.stats.cache_hits == 1U,
+        "Track write-through operations and cache hits"
+    );
+
+    /*
+     * Test 14: Read a block not present in the cache.
+     */
+    result = vfs_disk_read_block(&disk, 101U, read_buffer);
+
+    CHECK(
+        result == 0 &&
+        disk.stats.cache_misses == 1U &&
+        disk.stats.physical_reads == 1U,
+        "Read a block on a cache miss"
+    );
+
+    /*
+     * Test 15: Read the same block again.
+     */
+    result = vfs_disk_read_block(&disk, 101U, read_buffer);
+
+    CHECK(
+        result == 0 &&
+        disk.stats.cache_hits == 2U &&
+        disk.stats.physical_reads == 1U,
+        "Serve a repeated read from the cache"
+    );
+
+    /*
+     * Test 16: Write a changed pattern to a cached block.
+     */
+    memset(write_buffer, 0xA5, sizeof(write_buffer));
+
+    result = vfs_disk_write_block(&disk, 101U, write_buffer);
+
+    CHECK(
+        result == 0,
+        "Write updated data to a cached block"
+    );
+
+    /*
+     * Test 17: Confirm the updated cached contents are returned.
+     */
+    memset(read_buffer, 0, sizeof(read_buffer));
+
+    result = vfs_disk_read_block(&disk, 101U, read_buffer);
+
     CHECK(
         result == 0 &&
         memcmp(write_buffer, read_buffer, VFS_BLOCK_SIZE) == 0,
-        "Read back the block and verify its contents"
+        "Read updated data after a cached write"
     );
+
+    /*
+     * Test 18: Fill the cache with more than its capacity.
+     */
+    bool eviction_reads_succeeded = true;
+
+    for (uint32_t block = 200U;
+         block < 200U + VFS_CACHE_CAPACITY;
+         block++) {
+        if (vfs_disk_read_block(
+                &disk, block, read_buffer) == -1) {
+            eviction_reads_succeeded = false;
+            break;
+        }
+    }
+
+    CHECK(
+        eviction_reads_succeeded,
+        "Read enough distinct blocks to fill the cache"
+    );
+
+    /*
+     * Test 19: Block 100 should have been evicted because it
+     * was least recently used before the sequence above.
+     */
+    uint64_t physical_reads_before_eviction_check =
+        disk.stats.physical_reads;
+
+    result = vfs_disk_read_block(&disk, 100U, read_buffer);
+
+    CHECK(
+        result == 0 &&
+        disk.stats.physical_reads ==
+            physical_reads_before_eviction_check + 1U &&
+        disk.stats.cache_misses >= 2U,
+        "Reload an evicted block from disk"
+    );
+
 
     /*
      * Test 8: Reject an out-of-range block number.
