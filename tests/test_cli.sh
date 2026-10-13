@@ -59,16 +59,24 @@ if printf '%s\n' \
     'makedir work' \
     'changedir work' \
     'create child.txt' \
+    'check' \
     'write child.txt child-data' \
+    'check' \
     'back' \
     'removedir work' \
+    'check' \
     'changedir work' \
     'delete child.txt' \
+    'check' \
     'back' \
     'removedir work' \
+    'check' \
     'create sample.txt' \
+    'check' \
     'write sample.txt hello world' \
+    'check' \
     'append sample.txt !!!' \
+    'check' \
     'read sample.txt' \
     'stat sample.txt' \
     'check' \
@@ -112,6 +120,15 @@ assert_contains "$SESSION1" \
 assert_contains "$SESSION1" \
     "Result: CONSISTENT" \
     "Pass the filesystem consistency check"
+
+# Nine checks run at distinct lifecycle points in the first session.
+consistency_results=$(grep -Fxc "Result: CONSISTENT" "$SESSION1" || true)
+if [ "$consistency_results" -eq 9 ]; then
+    pass "Pass all 9 consistency checks across the filesystem lifecycle"
+else
+    printf 'Expected 9 consistent results; found %s\n' "$consistency_results" >&2
+    fail "Pass all 9 consistency checks across the filesystem lifecycle"
+fi
 
 # 3. Reopen the same image to test persistence.
 if printf '%s\n' \
