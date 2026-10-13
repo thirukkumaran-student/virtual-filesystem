@@ -130,6 +130,26 @@ static int create_directory_inode(
     );
 }
 
+
+/*
+ * Mirror the directory index's FNV-1a hash for collision test inputs.
+ * The production table starts at capacity 16, so matching low four
+ * bits guarantees the names share the same initial table slot.
+ */
+static uint32_t test_name_hash(const char *name)
+{
+    uint32_t hash = UINT32_C(2166136261);
+
+    for (const unsigned char *p = (const unsigned char *)name;
+         *p != '\0';
+         p++) {
+        hash ^= (uint32_t)*p;
+        hash *= UINT32_C(16777619);
+    }
+
+    return hash;
+}
+
 int main(void)
 {
     vfs_disk_t disk = {
@@ -514,6 +534,134 @@ int main(void)
         "Reject removal of a nonexistent entry"
     );
 
+
+    /*
+     * Directory-index regression tests.
+     */
+    CHECK(
+        (test_name_hash("idx0.txt") & 15U) ==
+        (test_name_hash("idx13.txt") & 15U),
+        "Collision test names share the same initial hash-table slot"
+    );
+
+    result = vfs_dir_add(
+        &disk,
+        root_inode,
+        "idx0.txt",
+        file_inode,
+        VFS_DIRENT_REGULAR
+    );
+
+    CHECK(result == 0, "Insert first directory-index collision name");
+
+    result = vfs_dir_add(
+        &disk,
+        root_inode,
+        "idx13.txt",
+        file_inode,
+        VFS_DIRENT_REGULAR
+    );
+
+    CHECK(result == 0, "Insert second directory-index collision name");
+
+    found_inode = UINT32_MAX;
+    result = vfs_dir_lookup(
+        &disk,
+        root_inode,
+        "idx0.txt",
+        &found_inode
+    );
+
+    CHECK(
+        result == 0 && found_inode == file_inode,
+        "Resolve first name despite a hash-table collision"
+    );
+
+    found_inode = UINT32_MAX;
+    result = vfs_dir_lookup(
+        &disk,
+        root_inode,
+        "idx13.txt",
+        &found_inode
+    );
+
+    CHECK(
+        result == 0 && found_inode == file_inode,
+        "Resolve second name despite a hash-table collision"
+    );
+
+    /*
+     * Add after the index has been built. The next lookup must rebuild
+     * the index and find the new entry.
+     */
+    result = vfs_dir_add(
+        &disk,
+        root_inode,
+        "after-index.txt",
+        file_inode,
+        VFS_DIRENT_REGULAR
+    );
+
+    CHECK(result == 0, "Add a filename after the index is built");
+
+    uint64_t builds_before_add_lookup = disk.stats.directory_index_builds;
+    found_inode = UINT32_MAX;
+    result = vfs_dir_lookup(
+        &disk,
+        root_inode,
+        "after-index.txt",
+        &found_inode
+    );
+
+    CHECK(
+        result == 0 &&
+        found_inode == file_inode &&
+        disk.stats.directory_index_builds == builds_before_add_lookup + 1U,
+        "Adding an entry invalidates and rebuilds the directory index"
+    );
+
+    /*
+     * Remove an indexed entry. A later lookup must not return stale data.
+     */
+    result = vfs_dir_remove(&disk, root_inode, "idx0.txt");
+    CHECK(result == 0, "Remove an entry after the index is built");
+
+    uint64_t builds_before_remove_lookup = disk.stats.directory_index_builds;
+    errno = 0;
+    found_inode = UINT32_MAX;
+    result = vfs_dir_lookup(
+        &disk,
+        root_inode,
+        "idx0.txt",
+        &found_inode
+    );
+
+    CHECK(
+        result == -1 &&
+        errno == ENOENT &&
+        disk.stats.directory_index_builds == builds_before_remove_lookup + 1U,
+        "Removing an entry invalidates the index and prevents stale lookup"
+    );
+
+    /*
+     * A repeated lookup against the current index should reuse it.
+     */
+    uint64_t hits_before_reuse = disk.stats.directory_index_hits;
+    found_inode = UINT32_MAX;
+    result = vfs_dir_lookup(
+        &disk,
+        root_inode,
+        "idx13.txt",
+        &found_inode
+    );
+
+    CHECK(
+        result == 0 &&
+        found_inode == file_inode &&
+        disk.stats.directory_index_hits == hits_before_reuse + 1U,
+        "Reuse an already-built directory index"
+    );
+
     /*
      * Test 24: Synchronize directory changes.
      */
@@ -545,11 +693,30 @@ int main(void)
     );
 
     /*
-     * Test 27: Verify that the subdirectory entry persists.
+     * Test 27: Verify persistence and lazy index reconstruction.
      */
     if (result == 0) {
-        found_inode = UINT32_MAX;
+        CHECK(
+            disk.stats.directory_index_builds == 0U,
+            "Opening the image starts with no persisted in-memory index"
+        );
 
+        found_inode = UINT32_MAX;
+        result = vfs_dir_lookup(
+            &disk,
+            root_inode,
+            "idx13.txt",
+            &found_inode
+        );
+
+        CHECK(
+            result == 0 &&
+            found_inode == file_inode &&
+            disk.stats.directory_index_builds == 1U,
+            "Rebuild the directory index from persistent records after reopen"
+        );
+
+        found_inode = UINT32_MAX;
         result = vfs_dir_lookup(
             &disk,
             root_inode,
@@ -558,14 +725,16 @@ int main(void)
         );
 
         CHECK(
-            result == 0 && found_inode == directory_inode,
-            "Preserve directory entries after reopening"
+            result == 0 &&
+            found_inode == directory_inode &&
+            disk.stats.directory_index_builds == 1U &&
+            disk.stats.directory_index_hits == 1U,
+            "Reuse the rebuilt index and preserve directory entries after reopen"
         );
     } else {
-        CHECK(
-            0,
-            "Preserve directory entries after reopening"
-        );
+        CHECK(0, "Opening the image starts with no persisted in-memory index");
+        CHECK(0, "Rebuild the directory index from persistent records after reopen");
+        CHECK(0, "Reuse the rebuilt index and preserve directory entries after reopen");
     }
 
     /*
