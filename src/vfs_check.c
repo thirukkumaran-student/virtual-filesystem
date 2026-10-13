@@ -1,4 +1,3 @@
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "vfs_check.h"
@@ -186,125 +185,143 @@ int vfs_check(vfs_disk_t *disk, FILE *output)
             continue;
         }
 
-        if (inode.indirect_block != 0U) {
-            report_failure(
-                output,
-                &errors,
-                "Indirect-block pointers are unsupported by this checker."
-            );
+        if (type == VFS_MODE_DIRECTORY && inode.indirect_block != 0U) {
+            report_failure(output, &errors,
+                           "A directory uses unsupported indirect addressing.");
         }
 
         if (type == VFS_MODE_DIRECTORY &&
-            (inode.size == 0U ||
-             inode.size % VFS_BLOCK_SIZE != 0U)) {
-            report_failure(
-                output,
-                &errors,
-                "A directory has an invalid size."
-            );
+            (inode.size == 0U || inode.size % VFS_BLOCK_SIZE != 0U)) {
+            report_failure(output, &errors, "A directory has an invalid size.");
         }
 
-        if (type == VFS_MODE_REGULAR &&
-            inode.size > VFS_FILE_MAX_SIZE) {
-            report_failure(
-                output,
-                &errors,
-                "A regular file exceeds the supported direct-block size."
-            );
+        if (type == VFS_MODE_REGULAR && inode.size > VFS_FILE_MAX_SIZE) {
+            report_failure(output, &errors,
+                           "A regular file exceeds the supported maximum size.");
         }
 
         uint64_t required_blocks =
             (inode.size + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE;
+        uint64_t max_blocks = type == VFS_MODE_DIRECTORY
+            ? VFS_INODE_DIRECT_BLOCKS : VFS_FILE_MAX_BLOCKS;
 
-        if (required_blocks > VFS_INODE_DIRECT_BLOCKS) {
-            report_failure(
-                output,
-                &errors,
-                "An inode requires more blocks than its direct pointers support."
-            );
+        if (required_blocks > max_blocks) {
+            report_failure(output, &errors,
+                           "An inode requires more blocks than its addressing supports.");
             continue;
         }
 
         if (inode_number == VFS_ROOT_INODE &&
             (type != VFS_MODE_DIRECTORY ||
              inode.direct_blocks[0] != VFS_DATA_START)) {
-            report_failure(
-                output,
-                &errors,
-                "The root inode does not reference the expected root directory block."
-            );
+            report_failure(output, &errors,
+                           "The root inode does not reference the expected root directory block.");
         }
 
-        for (uint32_t index = 0U;
-             index < VFS_INODE_DIRECT_BLOCKS;
-             index++) {
+        for (uint32_t index = 0U; index < VFS_INODE_DIRECT_BLOCKS; index++) {
             uint32_t block = inode.direct_blocks[index];
-
             if (index < required_blocks && block == 0U) {
-                report_failure(
-                    output,
-                    &errors,
-                    "An inode is missing a required direct block."
-                );
+                report_failure(output, &errors,
+                               "An inode is missing a required direct block.");
                 continue;
             }
-
             if (index >= required_blocks && block != 0U) {
-                report_failure(
-                    output,
-                    &errors,
-                    "An inode has an unexpected direct block beyond its size."
-                );
+                report_failure(output, &errors,
+                               "An inode has an unexpected direct block beyond its size.");
             }
-
-            if (block == 0U) {
+            if (block == 0U) continue;
+            if (block < VFS_DATA_START || block >= VFS_TOTAL_BLOCKS) {
+                report_failure(output, &errors,
+                               "An inode contains an out-of-range data-block pointer.");
                 continue;
             }
-
-            if (block < VFS_DATA_START ||
-                block >= VFS_TOTAL_BLOCKS) {
-                report_failure(
-                    output,
-                    &errors,
-                    "An inode contains an out-of-range data-block pointer."
-                );
+            if (block == VFS_DATA_START && inode_number != VFS_ROOT_INODE) {
+                report_failure(output, &errors,
+                               "A non-root inode references the reserved root directory block.");
                 continue;
             }
-
-            if (block == VFS_DATA_START &&
-                inode_number != VFS_ROOT_INODE) {
-                report_failure(
-                    output,
-                    &errors,
-                    "A non-root inode references the reserved root directory block."
-                );
-                continue;
-            }
-
             if (!bitmap_test(block_bitmap, block)) {
-                report_failure(
-                    output,
-                    &errors,
-                    "An inode references a block marked free."
-                );
+                report_failure(output, &errors,
+                               "An inode references a block marked free.");
             }
-
-
-            bool root_block_reference =
-                block == VFS_DATA_START &&
-                inode_number == VFS_ROOT_INODE;
-
-            if (block_owner[block] != -1 &&
-                !root_block_reference) {
-                report_failure(
-                    output,
-                    &errors,
-                    "A data block is referenced more than once."
-                );
+            bool root_reference = block == VFS_DATA_START &&
+                                  inode_number == VFS_ROOT_INODE;
+            if (block_owner[block] != -1 && !root_reference) {
+                report_failure(output, &errors,
+                               "A data block is referenced more than once.");
             } else if (block_owner[block] == -1) {
                 block_owner[block] = (int32_t)inode_number;
             }
+        }
 
+        if (type == VFS_MODE_DIRECTORY) {
+            if (inode.indirect_block != 0U) {
+                /* Already reported above; do not interpret directory pointers. */
+            }
+            continue;
+        }
+
+        uint32_t indirect_required = required_blocks > VFS_INODE_DIRECT_BLOCKS
+            ? (uint32_t)(required_blocks - VFS_INODE_DIRECT_BLOCKS) : 0U;
+
+        if (indirect_required == 0U && inode.indirect_block != 0U) {
+            report_failure(output, &errors,
+                           "A regular file has an unnecessary indirect block.");
+        }
+        if (indirect_required > 0U && inode.indirect_block == 0U) {
+            report_failure(output, &errors,
+                           "A regular file is missing its indirect block.");
+            continue;
+        }
+        if (inode.indirect_block == 0U) continue;
+
+        uint32_t iblock = inode.indirect_block;
+        if (iblock < VFS_DATA_START || iblock >= VFS_TOTAL_BLOCKS) {
+            report_failure(output, &errors,
+                           "An inode contains an invalid indirect-block pointer.");
+            continue;
+        }
+        if (!bitmap_test(block_bitmap, iblock)) {
+            report_failure(output, &errors,
+                           "An indirect block is marked free in the bitmap.");
+        }
+        if (iblock == VFS_DATA_START || block_owner[iblock] != -1) {
+            report_failure(output, &errors,
+                           "An indirect block is already owned or references a reserved block.");
+            continue;
+        }
+        block_owner[iblock] = (int32_t)inode_number;
+
+        uint8_t indirect_table[VFS_BLOCK_SIZE];
+        if (vfs_disk_read_block(disk, iblock, indirect_table) == -1) return -1;
+        uint32_t pointer_count = VFS_BLOCK_SIZE / 4U;
+        for (uint32_t i = 0U; i < pointer_count; i++) {
+            uint32_t block = get_u32_le(indirect_table + (size_t)i * 4U);
+            if (i < indirect_required && block == 0U) {
+                report_failure(output, &errors,
+                               "An indirect block is missing a required data pointer.");
+                continue;
+            }
+            if (i >= indirect_required && block != 0U) {
+                report_failure(output, &errors,
+                               "An indirect block contains an unexpected pointer beyond file size.");
+            }
+            if (block == 0U) continue;
+            if (block < VFS_DATA_START || block >= VFS_TOTAL_BLOCKS) {
+                report_failure(output, &errors,
+                               "An indirect pointer references an out-of-range block.");
+                continue;
+            }
+            if (!bitmap_test(block_bitmap, block)) {
+                report_failure(output, &errors,
+                               "An indirect pointer references a block marked free.");
+            }
+            if (block == VFS_DATA_START || block_owner[block] != -1) {
+                report_failure(output, &errors,
+                               "An indirect data block is referenced more than once or is reserved.");
+            } else {
+                block_owner[block] = (int32_t)inode_number;
+            }
         }
     }
 

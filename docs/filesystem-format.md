@@ -214,11 +214,16 @@ This is approximately 4.03 MiB.
 The single-indirect block itself consumes one allocated data-region
 block and is not counted as file payload.
 
-The implementation must reject file operations that exceed the supported
-maximum file size. It must also reject invalid, reserved, or out-of-range
-block pointers.
+The implementation supports the eight direct pointers and one single-indirect
+pointer. The indirect block is serialized as 1,024 little-endian 32-bit block
+numbers. Regular-file read, write, truncate, and consistency-check operations
+must validate indirect pointers and release the indirect block when no longer
+needed.
 
-Double-indirect and triple-indirect addressing are not part of version 1.
+The theoretical maximum file size is 4,227,072 bytes (about 4.03 MiB), subject
+to available data blocks. Operations must reject larger sizes and invalid,
+reserved, or out-of-range block pointers. Double-indirect and triple-indirect
+addressing are not part of version 1.
 
 ## 8. Allocation Bitmaps
 

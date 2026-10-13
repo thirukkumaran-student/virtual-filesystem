@@ -49,4 +49,9 @@ int vfs_dir_remove(
     const char *name
 );
 
+/*
+ * Release all in-memory directory indexes associated with this disk.
+ * Called when the disk handle is closed.
+ */
+void vfs_dir_index_reset(vfs_disk_t *disk);
 #endif

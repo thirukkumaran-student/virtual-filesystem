@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "vfs_file.h"
-
 #include "vfs_alloc.h"
 #include "vfs_dir.h"
 #include "vfs_format.h"
@@ -9,602 +8,398 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-/*
- * Return the current Unix timestamp.
- */
+#define PTRS_PER_INDIRECT (VFS_BLOCK_SIZE / 4U)
+
 static uint64_t current_timestamp(void)
 {
     time_t now = time(NULL);
-
     return now < (time_t)0 ? 0U : (uint64_t)now;
 }
 
-/*
- * Validate an open, formatted disk image.
- */
+static uint32_t get_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8U) |
+           ((uint32_t)p[2] << 16U) | ((uint32_t)p[3] << 24U);
+}
+
+static void put_u32_le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xffU);
+    p[1] = (uint8_t)((v >> 8U) & 0xffU);
+    p[2] = (uint8_t)((v >> 16U) & 0xffU);
+    p[3] = (uint8_t)((v >> 24U) & 0xffU);
+}
+
 static int validate_disk(vfs_disk_t *disk)
 {
     if (disk == NULL || !disk->is_open || disk->fd < 0) {
         errno = EINVAL;
         return -1;
     }
-
     if (vfs_is_formatted(disk) != 1) {
         errno = EINVAL;
         return -1;
     }
-
     return 0;
 }
 
-/*
- * Read an inode and ensure it represents a regular file.
- */
-static int read_regular_inode(
-    vfs_disk_t *disk,
-    uint32_t inode_number,
-    vfs_inode_t *inode
-)
+static int read_regular_inode(vfs_disk_t *disk, uint32_t ino,
+                              vfs_inode_t *inode)
 {
-    if (inode == NULL) {
-        errno = EINVAL;
+    if (inode == NULL || validate_disk(disk) == -1) {
+        if (inode == NULL) errno = EINVAL;
         return -1;
     }
-
-    if (validate_disk(disk) == -1) {
-        return -1;
-    }
-
-    if (vfs_inode_read(disk, inode_number, inode) == -1) {
-        return -1;
-    }
-
+    if (vfs_inode_read(disk, ino, inode) == -1) return -1;
     if ((inode->mode & 0170000U) != VFS_MODE_REGULAR) {
         errno = EISDIR;
         return -1;
     }
-
     if (inode->size > VFS_FILE_MAX_SIZE) {
         errno = EIO;
         return -1;
     }
-
     return 0;
 }
 
-/*
- * Validate a data-block pointer before using it.
- */
-static int validate_data_block(uint32_t block_number)
+static int validate_data_block(uint32_t block)
 {
-    if (block_number < VFS_DATA_START ||
-        block_number >= VFS_TOTAL_BLOCKS) {
+    if (block < VFS_DATA_START || block >= VFS_TOTAL_BLOCKS) {
         errno = EIO;
         return -1;
     }
-
     return 0;
 }
 
-/*
- * Create a regular file and link it into its parent directory.
- */
-int vfs_file_create(
-    vfs_disk_t *disk,
-    uint32_t parent_inode_number,
-    const char *name,
-    uint32_t *inode_number
-)
+static uint32_t pointer_get(const uint8_t *table, uint32_t index)
 {
-    if (disk == NULL ||
-        !disk->is_open ||
-        disk->fd < 0 ||
-        name == NULL ||
-        inode_number == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (validate_disk(disk) == -1) {
-        return -1;
-    }
-
-    uint32_t allocated_inode;
-
-    if (vfs_alloc_inode(disk, &allocated_inode) == -1) {
-        return -1;
-    }
-
-    uint64_t timestamp = current_timestamp();
-
-    vfs_inode_t inode;
-    memset(&inode, 0, sizeof(inode));
-
-    inode.mode = (uint16_t)(VFS_MODE_REGULAR | 0644U);
-    inode.uid = 0U;
-    inode.gid = 0U;
-    inode.links = 1U;
-    inode.size = 0U;
-    inode.atime = timestamp;
-    inode.mtime = timestamp;
-    inode.ctime = timestamp;
-
-    if (vfs_inode_write(
-            disk,
-            allocated_inode,
-            &inode) == -1) {
-        int saved_errno = errno;
-        (void)vfs_free_inode(disk, allocated_inode);
-        errno = saved_errno;
-        return -1;
-    }
-
-    if (vfs_dir_add(
-            disk,
-            parent_inode_number,
-            name,
-            allocated_inode,
-            VFS_DIRENT_REGULAR) == -1) {
-        int saved_errno = errno;
-
-        /*
-         * The directory entry was not created. Clear the inode
-         * before returning it to the free-inode pool.
-         */
-        memset(&inode, 0, sizeof(inode));
-
-        if (vfs_inode_write(
-                disk,
-                allocated_inode,
-                &inode) == 0) {
-            (void)vfs_free_inode(disk, allocated_inode);
-        }
-
-        errno = saved_errno;
-        return -1;
-    }
-
-    *inode_number = allocated_inode;
-    return 0;
+    return get_u32_le(table + (size_t)index * 4U);
 }
 
-/*
- * Read bytes from a regular file.
- */
-int64_t vfs_file_read(
-    vfs_disk_t *disk,
-    uint32_t inode_number,
-    void *buffer,
-    size_t count,
-    uint64_t offset
-)
+static void pointer_set(uint8_t *table, uint32_t index, uint32_t block)
 {
-    if (count > 0U && buffer == NULL) {
-        errno = EINVAL;
+    put_u32_le(table + (size_t)index * 4U, block);
+}
+
+/* logical_index is a file-data block index, not a physical block number. */
+static int get_data_block(const vfs_inode_t *inode,
+                          const uint8_t *indirect_table,
+                          uint32_t logical_index, uint32_t *physical)
+{
+    if (logical_index >= VFS_FILE_MAX_BLOCKS || physical == NULL) {
+        errno = EFBIG;
         return -1;
     }
-
-    if (count > (size_t)INT64_MAX) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    vfs_inode_t inode;
-
-    if (read_regular_inode(
-            disk,
-            inode_number,
-            &inode) == -1) {
-        return -1;
-    }
-
-    if (count == 0U || offset >= inode.size) {
-        return 0;
-    }
-
-    uint64_t available = inode.size - offset;
-
-    size_t bytes_to_read = count;
-
-    if ((uint64_t)bytes_to_read > available) {
-        bytes_to_read = (size_t)available;
-    }
-
-    uint8_t *output = buffer;
-    size_t total_read = 0U;
-
-    while (total_read < bytes_to_read) {
-        uint64_t position = offset + total_read;
-
-        uint32_t block_index =
-            (uint32_t)(position / VFS_BLOCK_SIZE);
-
-        uint32_t block_offset =
-            (uint32_t)(position % VFS_BLOCK_SIZE);
-
-        if (block_index >= VFS_INODE_DIRECT_BLOCKS) {
+    if (logical_index < VFS_INODE_DIRECT_BLOCKS) {
+        *physical = inode->direct_blocks[logical_index];
+    } else {
+        if (inode->indirect_block == 0U || indirect_table == NULL) {
             errno = EIO;
             return -1;
         }
-
-        uint32_t block_number = inode.direct_blocks[block_index];
-
-        if (validate_data_block(block_number) == -1) {
-            return -1;
-        }
-
-        uint8_t block[VFS_BLOCK_SIZE];
-
-        if (vfs_disk_read_block(
-                disk,
-                block_number,
-                block) == -1) {
-            return -1;
-        }
-
-        size_t chunk = VFS_BLOCK_SIZE - block_offset;
-
-        if (chunk > bytes_to_read - total_read) {
-            chunk = bytes_to_read - total_read;
-        }
-
-        memcpy(
-            output + total_read,
-            block + block_offset,
-            chunk
-        );
-
-        total_read += chunk;
+        *physical = pointer_get(indirect_table,
+                               logical_index - VFS_INODE_DIRECT_BLOCKS);
     }
-
-    inode.atime = current_timestamp();
-
-    if (vfs_inode_write(disk, inode_number, &inode) == -1) {
+    if (*physical == 0U) {
+        errno = EIO;
         return -1;
     }
-
-    return (int64_t)total_read;
+    return validate_data_block(*physical);
 }
 
-/*
- * Write bytes to a regular file.
- *
- * Sparse writes are rejected: offset must not exceed the current
- * file size. Blocks are zero-initialized when first allocated.
- */
-int64_t vfs_file_write(
-    vfs_disk_t *disk,
-    uint32_t inode_number,
-    const void *buffer,
-    size_t count,
-    uint64_t offset
-)
+static int load_indirect(vfs_disk_t *disk, const vfs_inode_t *inode,
+                         uint8_t table[VFS_BLOCK_SIZE])
 {
-    if (count > 0U && buffer == NULL) {
+    memset(table, 0, VFS_BLOCK_SIZE);
+    if (inode->indirect_block == 0U) return 0;
+    if (validate_data_block(inode->indirect_block) == -1) return -1;
+    return vfs_disk_read_block(disk, inode->indirect_block, table);
+}
+
+int vfs_file_create(vfs_disk_t *disk, uint32_t parent_ino,
+                    const char *name, uint32_t *inode_number)
+{
+    if (disk == NULL || !disk->is_open || disk->fd < 0 ||
+        name == NULL || inode_number == NULL) {
         errno = EINVAL;
         return -1;
     }
+    if (validate_disk(disk) == -1) return -1;
 
-    if (count > (size_t)INT64_MAX) {
+    uint32_t ino;
+    if (vfs_alloc_inode(disk, &ino) == -1) return -1;
+
+    uint64_t now = current_timestamp();
+    vfs_inode_t inode;
+    memset(&inode, 0, sizeof(inode));
+    inode.mode = (uint16_t)(VFS_MODE_REGULAR | 0644U);
+    inode.links = 1U;
+    inode.atime = inode.mtime = inode.ctime = now;
+    if (vfs_inode_write(disk, ino, &inode) == -1) {
+        int saved = errno;
+        (void)vfs_free_inode(disk, ino);
+        errno = saved;
+        return -1;
+    }
+    if (vfs_dir_add(disk, parent_ino, name, ino,
+                    VFS_DIRENT_REGULAR) == -1) {
+        int saved = errno;
+        memset(&inode, 0, sizeof(inode));
+        if (vfs_inode_write(disk, ino, &inode) == 0)
+            (void)vfs_free_inode(disk, ino);
+        errno = saved;
+        return -1;
+    }
+    *inode_number = ino;
+    return 0;
+}
+
+int64_t vfs_file_read(vfs_disk_t *disk, uint32_t ino, void *buffer,
+                      size_t count, uint64_t offset)
+{
+    if ((count > 0U && buffer == NULL) || count > (size_t)INT64_MAX) {
         errno = EINVAL;
         return -1;
     }
+    vfs_inode_t inode;
+    if (read_regular_inode(disk, ino, &inode) == -1) return -1;
+    if (count == 0U || offset >= inode.size) return 0;
 
-    if (count == 0U) {
-        vfs_inode_t inode;
+    uint64_t available = inode.size - offset;
+    size_t to_read = (uint64_t)count > available ? (size_t)available : count;
+    uint8_t indirect[VFS_BLOCK_SIZE];
+    if (load_indirect(disk, &inode, indirect) == -1) return -1;
 
-        if (read_regular_inode(
-                disk,
-                inode_number,
-                &inode) == -1) {
-            return -1;
-        }
-
-        return 0;
+    uint8_t *out = buffer;
+    size_t done = 0U;
+    while (done < to_read) {
+        uint64_t pos = offset + done;
+        uint32_t index = (uint32_t)(pos / VFS_BLOCK_SIZE);
+        uint32_t in_block = (uint32_t)(pos % VFS_BLOCK_SIZE);
+        uint32_t physical;
+        if (get_data_block(&inode, indirect, index, &physical) == -1) return -1;
+        uint8_t block[VFS_BLOCK_SIZE];
+        if (vfs_disk_read_block(disk, physical, block) == -1) return -1;
+        size_t chunk = VFS_BLOCK_SIZE - in_block;
+        if (chunk > to_read - done) chunk = to_read - done;
+        memcpy(out + done, block + in_block, chunk);
+        done += chunk;
     }
+    inode.atime = current_timestamp();
+    if (vfs_inode_write(disk, ino, &inode) == -1) return -1;
+    return (int64_t)done;
+}
 
+int64_t vfs_file_write(vfs_disk_t *disk, uint32_t ino, const void *buffer,
+                       size_t count, uint64_t offset)
+{
+    if ((count > 0U && buffer == NULL) || count > (size_t)INT64_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    vfs_inode_t inode;
+    if (read_regular_inode(disk, ino, &inode) == -1) return -1;
+    if (count == 0U) return 0;
     if (offset > UINT64_MAX - (uint64_t)count) {
         errno = EFBIG;
         return -1;
     }
-
-    uint64_t end_offset = offset + (uint64_t)count;
-
-    if (end_offset > VFS_FILE_MAX_SIZE) {
+    uint64_t end = offset + (uint64_t)count;
+    if (end > VFS_FILE_MAX_SIZE) {
         errno = EFBIG;
         return -1;
     }
-
-    vfs_inode_t inode;
-
-    if (read_regular_inode(
-            disk,
-            inode_number,
-            &inode) == -1) {
-        return -1;
-    }
-
     if (offset > inode.size) {
         errno = EINVAL;
         return -1;
     }
 
-    uint32_t old_blocks = (uint32_t)(
-        (inode.size + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE
-    );
+    uint32_t old_blocks = (uint32_t)((inode.size + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE);
+    uint32_t needed = (uint32_t)((end + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE);
+    uint32_t newly_allocated[VFS_FILE_MAX_BLOCKS + 1U];
+    uint32_t new_count = 0U;
+    bool new_indirect = false;
+    bool table_dirty = false;
+    uint8_t indirect[VFS_BLOCK_SIZE];
+    uint8_t old_indirect[VFS_BLOCK_SIZE];
 
-    uint32_t required_blocks = (uint32_t)(
-        (end_offset + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE
-    );
+    if (load_indirect(disk, &inode, indirect) == -1) return -1;
+    memcpy(old_indirect, indirect, sizeof(indirect));
 
-    uint32_t newly_allocated[VFS_INODE_DIRECT_BLOCKS];
-    uint32_t newly_allocated_count = 0U;
-
-    /*
-     * Allocate and zero-initialize any blocks required by the write.
-     */
-    for (uint32_t i = old_blocks; i < required_blocks; i++) {
-        uint32_t new_block;
-
-        if (vfs_alloc_block(disk, &new_block) == -1) {
-            goto rollback_allocations;
+    if (needed > VFS_INODE_DIRECT_BLOCKS && inode.indirect_block == 0U) {
+        uint32_t iblock;
+        if (vfs_alloc_block(disk, &iblock) == -1) return -1;
+        inode.indirect_block = iblock;
+        memset(indirect, 0, sizeof(indirect));
+        uint8_t zero[VFS_BLOCK_SIZE] = {0};
+        if (vfs_disk_write_block(disk, iblock, zero) == -1) {
+            int saved = errno;
+            (void)vfs_free_block(disk, iblock);
+            errno = saved;
+            return -1;
         }
-
-        uint8_t zero_block[VFS_BLOCK_SIZE];
-        memset(zero_block, 0, sizeof(zero_block));
-
-        if (vfs_disk_write_block(
-                disk,
-                new_block,
-                zero_block) == -1) {
-            int saved_errno = errno;
-            (void)vfs_free_block(disk, new_block);
-            errno = saved_errno;
-            goto rollback_allocations;
-        }
-
-        inode.direct_blocks[i] = new_block;
-        newly_allocated[newly_allocated_count++] = new_block;
+        newly_allocated[new_count++] = iblock;
+        new_indirect = true;
+        table_dirty = true;
     }
 
-    /*
-     * Perform the data writes.
-     */
+    for (uint32_t i = old_blocks; i < needed; i++) {
+        uint32_t block;
+        if (vfs_alloc_block(disk, &block) == -1) goto rollback;
+        uint8_t zero[VFS_BLOCK_SIZE] = {0};
+        if (vfs_disk_write_block(disk, block, zero) == -1) {
+            int saved = errno;
+            (void)vfs_free_block(disk, block);
+            errno = saved;
+            goto rollback;
+        }
+        newly_allocated[new_count++] = block;
+        if (i < VFS_INODE_DIRECT_BLOCKS) {
+            inode.direct_blocks[i] = block;
+        } else {
+            pointer_set(indirect, i - VFS_INODE_DIRECT_BLOCKS, block);
+            table_dirty = true;
+        }
+    }
+
     {
         const uint8_t *input = buffer;
-        size_t total_written = 0U;
-
-        while (total_written < count) {
-            uint64_t position = offset + total_written;
-
-            uint32_t block_index =
-                (uint32_t)(position / VFS_BLOCK_SIZE);
-
-            uint32_t block_offset =
-                (uint32_t)(position % VFS_BLOCK_SIZE);
-
-            uint32_t block_number = inode.direct_blocks[block_index];
-
-            if (validate_data_block(block_number) == -1) {
-                goto rollback_allocations;
-            }
-
+        size_t done = 0U;
+        while (done < count) {
+            uint64_t pos = offset + done;
+            uint32_t index = (uint32_t)(pos / VFS_BLOCK_SIZE);
+            uint32_t in_block = (uint32_t)(pos % VFS_BLOCK_SIZE);
+            uint32_t physical;
+            if (get_data_block(&inode, indirect, index, &physical) == -1) goto rollback;
             uint8_t block[VFS_BLOCK_SIZE];
-
-            if (vfs_disk_read_block(
-                    disk,
-                    block_number,
-                    block) == -1) {
-                goto rollback_allocations;
-            }
-
-            size_t chunk = VFS_BLOCK_SIZE - block_offset;
-
-            if (chunk > count - total_written) {
-                chunk = count - total_written;
-            }
-
-            memcpy(
-                block + block_offset,
-                input + total_written,
-                chunk
-            );
-
-            if (vfs_disk_write_block(
-                    disk,
-                    block_number,
-                    block) == -1) {
-                goto rollback_allocations;
-            }
-
-            total_written += chunk;
+            if (vfs_disk_read_block(disk, physical, block) == -1) goto rollback;
+            size_t chunk = VFS_BLOCK_SIZE - in_block;
+            if (chunk > count - done) chunk = count - done;
+            memcpy(block + in_block, input + done, chunk);
+            if (vfs_disk_write_block(disk, physical, block) == -1) goto rollback;
+            done += chunk;
         }
     }
 
-    if (end_offset > inode.size) {
-        inode.size = end_offset;
-    }
-
-    inode.mtime = current_timestamp();
-    inode.ctime = inode.mtime;
-
-    if (vfs_inode_write(
-            disk,
-            inode_number,
-            &inode) == -1) {
-        goto rollback_allocations;
-    }
-
+    if (table_dirty && vfs_disk_write_block(disk, inode.indirect_block, indirect) == -1)
+        goto rollback;
+    if (end > inode.size) inode.size = end;
+    inode.mtime = inode.ctime = current_timestamp();
+    if (vfs_inode_write(disk, ino, &inode) == -1) goto rollback;
     return (int64_t)count;
 
-rollback_allocations:
+rollback:
     {
-        int saved_errno = errno;
-
-        /*
-         * Roll back blocks allocated during this operation.
-         * This is best-effort rollback, not a crash-safe transaction.
-         */
-        for (uint32_t i = 0U; i < newly_allocated_count; i++) {
+        int saved = errno;
+        if (inode.indirect_block != 0U && !new_indirect && table_dirty)
+            (void)vfs_disk_write_block(disk, inode.indirect_block, old_indirect);
+        for (uint32_t i = 0U; i < new_count; i++)
             (void)vfs_free_block(disk, newly_allocated[i]);
-        }
-
-        errno = saved_errno;
+        errno = saved;
         return -1;
     }
 }
 
-/*
- * Truncate a regular file.
- */
-int vfs_file_truncate(
-    vfs_disk_t *disk,
-    uint32_t inode_number,
-    uint64_t new_size
-)
+int vfs_file_truncate(vfs_disk_t *disk, uint32_t ino, uint64_t new_size)
 {
     if (new_size > VFS_FILE_MAX_SIZE) {
         errno = EFBIG;
         return -1;
     }
-
     vfs_inode_t inode;
-
-    if (read_regular_inode(
-            disk,
-            inode_number,
-            &inode) == -1) {
-        return -1;
-    }
-
-    if (new_size == inode.size) {
-        return 0;
-    }
+    if (read_regular_inode(disk, ino, &inode) == -1) return -1;
+    if (new_size == inode.size) return 0;
 
     if (new_size > inode.size) {
-        /*
-         * Growing the file must zero-fill the newly exposed region.
-         */
-        uint64_t extension_size = new_size - inode.size;
-
-        if (extension_size > SIZE_MAX) {
+        uint64_t extension = new_size - inode.size;
+        if (extension > SIZE_MAX) {
             errno = EFBIG;
             return -1;
         }
-
-        size_t bytes_to_write = (size_t)extension_size;
-
-        /*
-         * The maximum file size is only 32768 bytes, so a fixed-size
-         * zero buffer is sufficient for this direct-block version.
-         */
-        uint8_t zeros[VFS_FILE_MAX_SIZE];
-        memset(zeros, 0, sizeof(zeros));
-
-        int64_t written = vfs_file_write(
-            disk,
-            inode_number,
-            zeros,
-            bytes_to_write,
-            inode.size
-        );
-
-        if (written < 0) {
-            return -1;
-        }
-
-        if ((uint64_t)written != extension_size) {
+        uint8_t *zeros = calloc((size_t)extension == 0U ? 1U : (size_t)extension, 1U);
+        if (zeros == NULL) return -1;
+        int64_t written = vfs_file_write(disk, ino, zeros, (size_t)extension, inode.size);
+        int saved = errno;
+        free(zeros);
+        errno = saved;
+        if (written < 0) return -1;
+        if ((uint64_t)written != extension) {
             errno = EIO;
             return -1;
         }
-
         return 0;
     }
 
-    /*
-     * Shrink the file.
-     */
-    uint32_t required_blocks = (uint32_t)(
-        (new_size + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE
-    );
+    uint8_t indirect[VFS_BLOCK_SIZE];
+    if (load_indirect(disk, &inode, indirect) == -1) return -1;
+    uint8_t old_indirect[VFS_BLOCK_SIZE];
+    memcpy(old_indirect, indirect, sizeof(indirect));
 
-    /*
-     * If the new EOF falls inside an allocated block, zero the
-     * discarded tail so that later file growth cannot expose stale
-     * bytes from the old contents.
-     */
-    if (new_size > 0U &&
-        new_size % VFS_BLOCK_SIZE != 0U) {
-
-        uint32_t block_index =
-            (uint32_t)(new_size / VFS_BLOCK_SIZE);
-
-        uint32_t block_number = inode.direct_blocks[block_index];
-
-        if (validate_data_block(block_number) == -1) {
-            return -1;
-        }
-
+    uint32_t required = (uint32_t)((new_size + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE);
+    if (new_size > 0U && new_size % VFS_BLOCK_SIZE != 0U) {
+        uint32_t physical;
+        uint32_t index = (uint32_t)(new_size / VFS_BLOCK_SIZE);
+        if (get_data_block(&inode, indirect, index, &physical) == -1) return -1;
         uint8_t block[VFS_BLOCK_SIZE];
+        if (vfs_disk_read_block(disk, physical, block) == -1) return -1;
+        memset(block + (size_t)(new_size % VFS_BLOCK_SIZE), 0,
+               VFS_BLOCK_SIZE - (size_t)(new_size % VFS_BLOCK_SIZE));
+        if (vfs_disk_write_block(disk, physical, block) == -1) return -1;
+    }
 
-        if (vfs_disk_read_block(
-                disk,
-                block_number,
-                block) == -1) {
-            return -1;
+    uint32_t to_free[VFS_FILE_MAX_BLOCKS];
+    uint32_t free_count = 0U;
+    for (uint32_t i = required; i < VFS_FILE_MAX_BLOCKS; i++) {
+        uint32_t physical = 0U;
+        if (i < VFS_INODE_DIRECT_BLOCKS) {
+            physical = inode.direct_blocks[i];
+            inode.direct_blocks[i] = 0U;
+        } else if (inode.indirect_block != 0U) {
+            uint32_t pi = i - VFS_INODE_DIRECT_BLOCKS;
+            physical = pointer_get(indirect, pi);
+            if (physical != 0U) pointer_set(indirect, pi, 0U);
         }
-
-        uint32_t tail_offset =
-            (uint32_t)(new_size % VFS_BLOCK_SIZE);
-
-        memset(
-            block + tail_offset,
-            0,
-            VFS_BLOCK_SIZE - tail_offset
-        );
-
-        if (vfs_disk_write_block(
-                disk,
-                block_number,
-                block) == -1) {
-            return -1;
+        if (physical != 0U) {
+            if (validate_data_block(physical) == -1) return -1;
+            to_free[free_count++] = physical;
         }
     }
 
-    /*
-     * Release blocks beyond the new EOF.
-     */
-    for (uint32_t i = required_blocks;
-         i < VFS_INODE_DIRECT_BLOCKS;
-         i++) {
-
-        uint32_t block_number = inode.direct_blocks[i];
-
-        if (block_number == 0U) {
-            continue;
+    bool keep_indirect = false;
+    if (inode.indirect_block != 0U) {
+        for (uint32_t i = 0U; i < PTRS_PER_INDIRECT; i++) {
+            if (pointer_get(indirect, i) != 0U) {
+                keep_indirect = true;
+                break;
+            }
         }
-
-        if (validate_data_block(block_number) == -1) {
-            return -1;
-        }
-
-        if (vfs_free_block(disk, block_number) == -1) {
-            return -1;
-        }
-
-        inode.direct_blocks[i] = 0U;
+    }
+    uint32_t indirect_to_free = 0U;
+    if (inode.indirect_block != 0U && !keep_indirect) {
+        indirect_to_free = inode.indirect_block;
+        inode.indirect_block = 0U;
     }
 
     inode.size = new_size;
-    inode.mtime = current_timestamp();
-    inode.ctime = inode.mtime;
+    inode.mtime = inode.ctime = current_timestamp();
+    if (inode.indirect_block != 0U &&
+        vfs_disk_write_block(disk, inode.indirect_block, indirect) == -1) {
+        return -1;
+    }
+    if (vfs_inode_write(disk, ino, &inode) == -1) {
+        if (inode.indirect_block != 0U)
+            (void)vfs_disk_write_block(disk, inode.indirect_block, old_indirect);
+        return -1;
+    }
 
-    return vfs_inode_write(
-        disk,
-        inode_number,
-        &inode
-    );
+    for (uint32_t i = 0U; i < free_count; i++) {
+        if (vfs_free_block(disk, to_free[i]) == -1) return -1;
+    }
+    if (indirect_to_free != 0U && vfs_free_block(disk, indirect_to_free) == -1) return -1;
+    return 0;
 }

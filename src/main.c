@@ -91,6 +91,7 @@ static void print_help(void)
     printf("  exit                 Close the virtual filesystem\n\n");
 }
 
+
 static void print_disk_metrics(const vfs_disk_t *disk)
 {
     if (disk == NULL || !disk->is_open) {
@@ -100,28 +101,56 @@ static void print_disk_metrics(const vfs_disk_t *disk)
 
     const vfs_disk_stats_t *stats = &disk->stats;
 
-    uint64_t total_lookups =
+    uint64_t total_cache_lookups =
         stats->cache_hits + stats->cache_misses;
 
-    double hit_ratio = 0.0;
+    double cache_hit_ratio = 0.0;
 
-    if (total_lookups > 0U) {
-        hit_ratio =
-            ((double)stats->cache_hits / (double)total_lookups)
-            * 100.0;
+    if (total_cache_lookups > 0U) {
+        cache_hit_ratio =
+            ((double)stats->cache_hits /
+             (double)total_cache_lookups) * 100.0;
+    }
+
+    double directory_index_hit_ratio = 0.0;
+
+    if (stats->directory_lookups > 0U) {
+        directory_index_hit_ratio =
+            ((double)stats->directory_index_hits /
+             (double)stats->directory_lookups) * 100.0;
     }
 
     printf("\nDisk I/O and Cache Metrics\n");
     printf("==========================\n");
-    printf("Cache capacity:    %u blocks\n", VFS_CACHE_CAPACITY);
-    printf("Logical reads:     %" PRIu64 "\n", stats->logical_reads);
-    printf("Logical writes:    %" PRIu64 "\n", stats->logical_writes);
-    printf("Physical reads:    %" PRIu64 "\n", stats->physical_reads);
-    printf("Physical writes:   %" PRIu64 "\n", stats->physical_writes);
-    printf("Cache hits:        %" PRIu64 "\n", stats->cache_hits);
-    printf("Cache misses:      %" PRIu64 "\n", stats->cache_misses);
-    printf("Cache hit ratio:   %.2f%%\n\n", hit_ratio);
+    printf("Cache capacity:          %u blocks\n",
+           VFS_CACHE_CAPACITY);
+    printf("Logical reads:           %" PRIu64 "\n",
+           stats->logical_reads);
+    printf("Logical writes:          %" PRIu64 "\n",
+           stats->logical_writes);
+    printf("Physical reads:          %" PRIu64 "\n",
+           stats->physical_reads);
+    printf("Physical writes:         %" PRIu64 "\n",
+           stats->physical_writes);
+    printf("Cache hits:              %" PRIu64 "\n",
+           stats->cache_hits);
+    printf("Cache misses:            %" PRIu64 "\n",
+           stats->cache_misses);
+    printf("Cache hit ratio:         %.2f%%\n",
+           cache_hit_ratio);
+
+    printf("\nDirectory Index Metrics\n");
+    printf("=======================\n");
+    printf("Directory lookups:       %" PRIu64 "\n",
+           stats->directory_lookups);
+    printf("Directory index hits:    %" PRIu64 "\n",
+           stats->directory_index_hits);
+    printf("Directory index builds:  %" PRIu64 "\n",
+           stats->directory_index_builds);
+    printf("Index reuse ratio:       %.2f%%\n\n",
+           directory_index_hit_ratio);
 }
+
 
 static void print_filesystem_info(vfs_disk_t *disk)
 {

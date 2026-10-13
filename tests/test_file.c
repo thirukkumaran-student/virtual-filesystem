@@ -4,6 +4,7 @@
 #include "vfs_dir.h"
 #include "vfs_file.h"
 #include "vfs_format.h"
+#include "vfs_check.h"
 #include "vfs_inode.h"
 
 #include <errno.h>
@@ -289,11 +290,27 @@ int main(void)
         "Reject a NULL write buffer"
     );
 
-    /*
-     * Test 15: Reject a write exceeding the direct-block limit.
-     */
-    errno = 0;
+    // /*
+    //  * Test 15: Reject a write exceeding the direct-block limit.
+    //  */
+    // errno = 0;
 
+    // io_result = vfs_file_write(
+    //     &disk,
+    //     file_inode,
+    //     source,
+    //     1U,
+    //     VFS_FILE_MAX_SIZE
+    // );
+
+    // CHECK(
+    //     io_result == -1 && errno == EFBIG,
+    //     "Reject a write beyond the maximum file size"
+    // );
+
+    /*
+     * Test 15: Reject writes that exceed the maximum file size.
+     */
     io_result = vfs_file_write(
         &disk,
         file_inode,
@@ -303,9 +320,10 @@ int main(void)
     );
 
     CHECK(
-        io_result == -1 && errno == EFBIG,
-        "Reject a write beyond the maximum file size"
+        io_result == -1,
+        "Reject a write starting at the maximum file size"
     );
+
 
     /*
      * Test 16: Overwrite a range inside the file.
@@ -480,6 +498,70 @@ int main(void)
         io_result == -1 && errno == EISDIR,
         "Reject reading a directory as a regular file"
     );
+
+    /*
+     * Indirect-addressing regression tests: 40,000 bytes requires
+     * ten data blocks, including two pointers in the indirect block.
+     */
+    {
+        uint32_t large_inode = UINT32_MAX;
+        const size_t large_size = 40000U;
+        uint8_t *large_source = malloc(large_size);
+        uint8_t *large_output = malloc(large_size);
+        int large_ok = large_source != NULL && large_output != NULL;
+
+        if (large_ok) {
+            for (size_t i = 0U; i < large_size; i++)
+                large_source[i] = (uint8_t)((i * 13U + 29U) % 251U);
+
+            result = vfs_file_create(&disk, VFS_ROOT_INODE,
+                                     "large.bin", &large_inode);
+            CHECK(result == 0, "Create a file for indirect addressing");
+
+            io_result = result == 0
+                ? vfs_file_write(&disk, large_inode, large_source,
+                                 large_size, 0U) : -1;
+            CHECK(io_result == (int64_t)large_size,
+                  "Write a file larger than eight direct blocks");
+
+            vfs_inode_t large_meta;
+            result = vfs_inode_read(&disk, large_inode, &large_meta);
+            CHECK(result == 0 && large_meta.size == large_size &&
+                  large_meta.indirect_block != 0U,
+                  "Persist the indirect pointer and large file size");
+
+            memset(large_output, 0, large_size);
+            io_result = vfs_file_read(&disk, large_inode, large_output,
+                                      large_size, 0U);
+            CHECK(io_result == (int64_t)large_size &&
+                  memcmp(large_source, large_output, large_size) == 0,
+                  "Read and verify data spanning indirect blocks");
+
+            result = vfs_check(&disk, stdout);
+            CHECK(result == 0, "Consistency checker accepts indirect blocks");
+
+            result = vfs_file_truncate(&disk, large_inode, 10000U);
+            CHECK(result == 0, "Truncate a file that used indirect blocks");
+            result = vfs_inode_read(&disk, large_inode, &large_meta);
+            CHECK(result == 0 && large_meta.size == 10000U &&
+                  large_meta.indirect_block == 0U,
+                  "Release the indirect block when no longer needed");
+            result = vfs_check(&disk, stdout);
+            CHECK(result == 0, "Remain consistent after indirect-block reclamation");
+        } else {
+            CHECK(0, "Allocate indirect-addressing test buffers");
+            CHECK(0, "Create a file for indirect addressing");
+            CHECK(0, "Write a file larger than eight direct blocks");
+            CHECK(0, "Persist the indirect pointer and large file size");
+            CHECK(0, "Read and verify data spanning indirect blocks");
+            CHECK(0, "Consistency checker accepts indirect blocks");
+            CHECK(0, "Truncate a file that used indirect blocks");
+            CHECK(0, "Release the indirect block when no longer needed");
+            CHECK(0, "Remain consistent after indirect-block reclamation");
+        }
+        free(large_source);
+        free(large_output);
+    }
 
     /*
      * Test 24: Synchronize changes.

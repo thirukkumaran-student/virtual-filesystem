@@ -2,7 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "vfs_disk.h"
-
+#include "vfs_dir.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -156,7 +156,7 @@ int vfs_disk_open(vfs_disk_t *disk, const char *path)
     memset(disk->cache, 0, sizeof(disk->cache));
     memset(&disk->stats, 0, sizeof(disk->stats));
     disk->cache_clock = 0U;
-
+    disk->directory_index_state = NULL;
     fd = open(path, O_RDWR);
 
     if (fd == -1) {
@@ -352,7 +352,7 @@ int vfs_disk_close(vfs_disk_t *disk)
         errno = EBADF;
         return -1;
     }
-
+    vfs_dir_index_reset(disk);
     int fd = disk->fd;
 
     disk->fd = -1;

@@ -23,6 +23,9 @@ typedef struct {
     uint64_t physical_writes;
     uint64_t cache_hits;
     uint64_t cache_misses;
+    uint64_t directory_lookups;
+uint64_t directory_index_hits;
+uint64_t directory_index_builds;
 } vfs_disk_stats_t;
 
 typedef struct {
@@ -41,7 +44,7 @@ typedef struct {
 typedef struct {
     int fd;
     bool is_open;
-
+    void *directory_index_state;
     vfs_cache_entry_t cache[VFS_CACHE_CAPACITY];
     uint64_t cache_clock;
     vfs_disk_stats_t stats;

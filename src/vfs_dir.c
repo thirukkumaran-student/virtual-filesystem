@@ -9,7 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
+#include <stdlib.h>
 #define DIRENT_HEADER_SIZE 8U
 #define DIRENT_ALIGNMENT   4U
 
@@ -241,7 +241,472 @@ static bool entry_name_matches(
             name_length
         ) == 0;
 }
+/*
+ * In-memory directory hash index.
+ *
+ * The index is not persisted. It is rebuilt from directory records
+ * when a directory is looked up for the first time after opening
+ * the disk image, or after that directory's index is invalidated.
+ */
+typedef struct {
+    bool occupied;
+    uint32_t hash;
+    uint32_t inode_number;
+    uint32_t name_length;
+    char name[VFS_NAME_MAX + 1U];
+} dir_index_entry_t;
 
+typedef struct dir_index {
+    uint32_t directory_inode_number;
+    size_t capacity;
+    size_t count;
+    bool built;
+    dir_index_entry_t *entries;
+    struct dir_index *next;
+} dir_index_t;
+
+typedef struct {
+    dir_index_t *directories;
+} dir_index_state_t;
+
+#define DIR_INDEX_INITIAL_CAPACITY 16U
+
+static uint32_t dir_name_hash(const char *name, uint32_t length)
+{
+    /* FNV-1a, using a 32-bit hash. */
+    uint32_t hash = UINT32_C(2166136261);
+
+    for (uint32_t i = 0U; i < length; i++) {
+        hash ^= (uint8_t)name[i];
+        hash *= UINT32_C(16777619);
+    }
+
+    return hash;
+}
+
+static dir_index_state_t *get_dir_index_state(vfs_disk_t *disk)
+{
+    if (disk->directory_index_state == NULL) {
+        dir_index_state_t *state = calloc(1U, sizeof(*state));
+
+        if (state == NULL) {
+            errno = ENOMEM;
+            return NULL;
+        }
+
+        disk->directory_index_state = state;
+    }
+
+    return (dir_index_state_t *)disk->directory_index_state;
+}
+
+static dir_index_t *find_directory_index(
+    dir_index_state_t *state,
+    uint32_t directory_inode_number
+)
+{
+    for (dir_index_t *index = state->directories;
+         index != NULL;
+         index = index->next) {
+
+        if (index->directory_inode_number ==
+            directory_inode_number) {
+            return index;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Insert into an already allocated hash table.
+ * Returns 0 on insertion, 1 for a duplicate name, or -1 on error.
+ */
+static int insert_index_entry(
+    dir_index_entry_t *entries,
+    size_t capacity,
+    uint32_t hash,
+    const char *name,
+    uint32_t name_length,
+    uint32_t inode_number
+)
+{
+    size_t slot = (size_t)hash & (capacity - 1U);
+
+    for (size_t probes = 0U; probes < capacity; probes++) {
+        dir_index_entry_t *entry = &entries[slot];
+
+        if (!entry->occupied) {
+            entry->occupied = true;
+            entry->hash = hash;
+            entry->inode_number = inode_number;
+            entry->name_length = name_length;
+
+            memcpy(entry->name, name, name_length);
+            entry->name[name_length] = '\0';
+
+            return 0;
+        }
+
+        if (entry->hash == hash &&
+            entry->name_length == name_length &&
+            memcmp(entry->name, name, name_length) == 0) {
+            return 1;
+        }
+
+        slot = (slot + 1U) & (capacity - 1U);
+    }
+
+    errno = ENOSPC;
+    return -1;
+}
+
+static int grow_directory_index(dir_index_t *index)
+{
+    size_t new_capacity = index->capacity == 0U
+        ? DIR_INDEX_INITIAL_CAPACITY
+        : index->capacity * 2U;
+
+    if (new_capacity < index->capacity ||
+        new_capacity > SIZE_MAX / sizeof(*index->entries)) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    dir_index_entry_t *new_entries = calloc(
+        new_capacity,
+        sizeof(*new_entries)
+    );
+
+    if (new_entries == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    for (size_t i = 0U; i < index->capacity; i++) {
+        const dir_index_entry_t *old = &index->entries[i];
+
+        if (!old->occupied) {
+            continue;
+        }
+
+        int result = insert_index_entry(
+            new_entries,
+            new_capacity,
+            old->hash,
+            old->name,
+            old->name_length,
+            old->inode_number
+        );
+
+        if (result != 0) {
+            free(new_entries);
+            errno = EIO;
+            return -1;
+        }
+    }
+
+    free(index->entries);
+    index->entries = new_entries;
+    index->capacity = new_capacity;
+
+    return 0;
+}
+
+static int add_to_directory_index(
+    dir_index_t *index,
+    const char *name,
+    uint32_t name_length,
+    uint32_t inode_number
+)
+{
+    /*
+     * Keep the load factor at or below approximately 70%.
+     * Capacities remain powers of two for efficient probing.
+     */
+    if (index->capacity == 0U ||
+        index->count + 1U > (index->capacity * 7U) / 10U) {
+
+        if (grow_directory_index(index) == -1) {
+            return -1;
+        }
+    }
+
+    uint32_t hash = dir_name_hash(name, name_length);
+
+    int result = insert_index_entry(
+        index->entries,
+        index->capacity,
+        hash,
+        name,
+        name_length,
+        inode_number
+    );
+
+    if (result == 1) {
+        errno = EIO;
+        return -1;
+    }
+
+    if (result == -1) {
+        return -1;
+    }
+
+    index->count++;
+    return 0;
+}
+
+/*
+ * Build the hash index from the directory's existing on-disk records.
+ */
+static int build_directory_index(
+    vfs_disk_t *disk,
+    dir_index_t *index
+)
+{
+    vfs_inode_t directory;
+
+    if (read_directory_inode(
+            disk,
+            index->directory_inode_number,
+            &directory) == -1) {
+        return -1;
+    }
+
+    index->capacity = 0U;
+    index->count = 0U;
+    index->entries = NULL;
+
+    uint64_t remaining = directory.size;
+
+    for (uint32_t i = 0U;
+         i < VFS_INODE_DIRECT_BLOCKS && remaining > 0U;
+         i++) {
+
+        uint32_t block_number = directory.direct_blocks[i];
+
+        if (block_number == 0U ||
+            block_number >= VFS_TOTAL_BLOCKS ||
+            block_number < VFS_DATA_START) {
+            errno = EIO;
+            goto fail;
+        }
+
+        uint8_t block[VFS_BLOCK_SIZE];
+
+        if (vfs_disk_read_block(
+                disk,
+                block_number,
+                block) == -1) {
+            goto fail;
+        }
+
+        uint32_t limit = remaining > VFS_BLOCK_SIZE
+            ? VFS_BLOCK_SIZE
+            : (uint32_t)remaining;
+
+        uint32_t offset = 0U;
+
+        while (offset < limit) {
+            uint32_t record_length;
+            uint32_t name_length;
+
+            if (validate_record(
+                    block,
+                    offset,
+                    limit,
+                    &record_length,
+                    &name_length) == -1) {
+                goto fail;
+            }
+
+            const uint8_t *entry = block + offset;
+
+            /*
+             * Deleted records have name_length == 0.
+             * Do not insert them into the hash index.
+             */
+            if (name_length != 0U) {
+                uint32_t inode_number = get_u32_le(
+                    entry + DIRENT_INODE_OFFSET
+                );
+
+                if (add_to_directory_index(
+                        index,
+                        (const char *)(entry + DIRENT_NAME_OFFSET),
+                        name_length,
+                        inode_number) == -1) {
+                    goto fail;
+                }
+            }
+
+            offset += record_length;
+        }
+
+        remaining -= limit;
+    }
+
+    if (remaining != 0U) {
+        errno = EIO;
+        goto fail;
+    }
+
+    index->built = true;
+    return 0;
+
+fail:
+    free(index->entries);
+    index->entries = NULL;
+    index->capacity = 0U;
+    index->count = 0U;
+    index->built = false;
+    return -1;
+}
+
+/*
+ * Obtain the directory index, building it if needed.
+ * was_already_built distinguishes a cache hit from a first lookup.
+ */
+static dir_index_t *get_directory_index(
+    vfs_disk_t *disk,
+    uint32_t directory_inode_number,
+    bool *was_already_built
+)
+{
+    dir_index_state_t *state = get_dir_index_state(disk);
+
+    if (state == NULL) {
+        return NULL;
+    }
+
+    dir_index_t *index = find_directory_index(
+        state,
+        directory_inode_number
+    );
+
+    if (index != NULL && index->built) {
+        *was_already_built = true;
+        return index;
+    }
+
+    *was_already_built = false;
+
+    if (index == NULL) {
+        index = calloc(1U, sizeof(*index));
+
+        if (index == NULL) {
+            errno = ENOMEM;
+            return NULL;
+        }
+
+        index->directory_inode_number = directory_inode_number;
+        index->next = state->directories;
+        state->directories = index;
+    }
+
+    if (build_directory_index(disk, index) == -1) {
+        return NULL;
+    }
+
+    disk->stats.directory_index_builds++;
+    return index;
+}
+
+static int lookup_directory_index(
+    const dir_index_t *index,
+    const char *name,
+    uint32_t name_length,
+    uint32_t *inode_number
+)
+{
+    if (index->capacity == 0U) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    uint32_t hash = dir_name_hash(name, name_length);
+    size_t slot = (size_t)hash & (index->capacity - 1U);
+
+    for (size_t probes = 0U; probes < index->capacity; probes++) {
+        const dir_index_entry_t *entry = &index->entries[slot];
+
+        if (!entry->occupied) {
+            errno = ENOENT;
+            return -1;
+        }
+
+        if (entry->hash == hash &&
+            entry->name_length == name_length &&
+            memcmp(entry->name, name, name_length) == 0) {
+            *inode_number = entry->inode_number;
+            return 0;
+        }
+
+        slot = (slot + 1U) & (index->capacity - 1U);
+    }
+
+    errno = ENOENT;
+    return -1;
+}
+
+/*
+ * Invalidate one directory's index after a successful mutation.
+ * The next lookup rebuilds it from the disk image.
+ */
+static void invalidate_directory_index(
+    vfs_disk_t *disk,
+    uint32_t directory_inode_number
+)
+{
+    if (disk == NULL || disk->directory_index_state == NULL) {
+        return;
+    }
+
+    dir_index_state_t *state =
+        (dir_index_state_t *)disk->directory_index_state;
+
+    dir_index_t *index = find_directory_index(
+        state,
+        directory_inode_number
+    );
+
+    if (index == NULL) {
+        return;
+    }
+
+    free(index->entries);
+    index->entries = NULL;
+    index->capacity = 0U;
+    index->count = 0U;
+    index->built = false;
+}
+
+/*
+ * Release every in-memory directory index associated with this disk.
+ */
+void vfs_dir_index_reset(vfs_disk_t *disk)
+{
+    if (disk == NULL || disk->directory_index_state == NULL) {
+        return;
+    }
+
+    dir_index_state_t *state =
+        (dir_index_state_t *)disk->directory_index_state;
+
+    dir_index_t *index = state->directories;
+
+    while (index != NULL) {
+        dir_index_t *next = index->next;
+
+        free(index->entries);
+        free(index);
+
+        index = next;
+    }
+
+    free(state);
+    disk->directory_index_state = NULL;
+}
 /*
  * Find an entry in a directory.
  *
@@ -387,17 +852,34 @@ int vfs_dir_lookup(
         return -1;
     }
 
-    return find_entry(
+    if (disk == NULL || !disk->is_open || disk->fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+
+    disk->stats.directory_lookups++;
+
+    bool was_already_built = false;
+
+    dir_index_t *index = get_directory_index(
         disk,
         directory_inode_number,
+        &was_already_built
+    );
+
+    if (index == NULL) {
+        return -1;
+    }
+
+    if (was_already_built) {
+        disk->stats.directory_index_hits++;
+    }
+
+    return lookup_directory_index(
+        index,
         name,
         name_length,
-        inode_number,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL
+        inode_number
     );
 }
 
@@ -649,8 +1131,13 @@ int vfs_dir_add(
     );
 
     if (result == 0) {
-        return 0;
-    }
+    invalidate_directory_index(
+        disk,
+        directory_inode_number
+    );
+
+    return 0;
+}
 
     if (result == -1) {
         return -1;
@@ -736,7 +1223,10 @@ int vfs_dir_add(
          */
         return -1;
     }
-
+    invalidate_directory_index(
+    disk,
+    directory_inode_number
+);
     return 0;
 }
 
@@ -824,9 +1314,17 @@ int vfs_dir_remove(
         );
     }
 
-    return vfs_disk_write_block(
+    if (vfs_disk_write_block(
         disk,
         block_number,
-        block
-    );
+        block) == -1) {
+    return -1;
+}
+
+invalidate_directory_index(
+    disk,
+    directory_inode_number
+);
+
+return 0;
 }
