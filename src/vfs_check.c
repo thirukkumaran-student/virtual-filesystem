@@ -4,6 +4,7 @@
 #include "vfs_file.h"
 #include "vfs_format.h"
 #include "vfs_inode.h"
+#include "vfs_dir.h"
 #include <stdbool.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -37,6 +38,111 @@ static void report_failure(
 {
     fprintf(output, "[FAIL] %s\n", message);
     (*errors)++;
+}
+
+static uint16_t get_u16_le(const uint8_t *buffer)
+{
+    return (uint16_t)(
+        (uint16_t)buffer[0] |
+        ((uint16_t)buffer[1] << 8U)
+    );
+}
+
+/* Validate live directory records and the inode references they contain. */
+static void check_directory_entries(
+    vfs_disk_t *disk,
+    uint32_t directory_inode_number,
+    const vfs_inode_t *directory,
+    const uint8_t *block_bitmap,
+    const uint8_t *inode_bitmap,
+    FILE *output,
+    uint32_t *errors)
+{
+    uint32_t block_count = (uint32_t)(
+        (directory->size + VFS_BLOCK_SIZE - 1U) / VFS_BLOCK_SIZE
+    );
+
+    for (uint32_t block_index = 0U; block_index < block_count; block_index++) {
+        uint32_t block_number = directory->direct_blocks[block_index];
+        if (block_number < VFS_DATA_START ||
+            block_number >= VFS_TOTAL_BLOCKS ||
+            !bitmap_test(block_bitmap, block_number)) {
+            continue;
+        }
+
+        uint8_t block[VFS_BLOCK_SIZE];
+        if (vfs_disk_read_block(disk, block_number, block) == -1) {
+            return;
+        }
+
+        uint32_t offset = 0U;
+        while (offset < VFS_BLOCK_SIZE) {
+            if (VFS_BLOCK_SIZE - offset < 8U) {
+                report_failure(output, errors,
+                    "A directory record header extends beyond its block.");
+                break;
+            }
+
+            const uint8_t *entry = block + offset;
+            uint32_t record_length = get_u16_le(entry + 4U);
+            uint32_t name_length = entry[7U];
+
+            if (record_length < 8U ||
+                record_length % 4U != 0U ||
+                record_length > VFS_BLOCK_SIZE - offset ||
+                name_length > VFS_NAME_MAX ||
+                name_length > record_length - 8U) {
+                report_failure(output, errors,
+                    "A directory contains a malformed record length or name length.");
+                break;
+            }
+
+            /* A zero-length name marks a deleted/free directory record. */
+            if (name_length != 0U) {
+                uint32_t target_inode = get_u32_le(entry);
+                uint8_t entry_type = entry[6U];
+
+                if (target_inode >= VFS_INODE_COUNT) {
+                    report_failure(output, errors,
+                        "A directory entry references an out-of-range inode.");
+                } else if (!bitmap_test(inode_bitmap, target_inode)) {
+                    report_failure(output, errors,
+                        "A directory entry references an inode marked free.");
+                } else if (entry_type != VFS_DIRENT_REGULAR &&
+                           entry_type != VFS_DIRENT_DIRECTORY) {
+                    report_failure(output, errors,
+                        "A directory entry has an invalid entry type.");
+                } else {
+                    vfs_inode_t target;
+                    if (vfs_inode_read(disk, target_inode, &target) == -1) {
+                        return;
+                    }
+                    uint16_t target_mode = (uint16_t)(target.mode & 0170000U);
+                    bool type_matches =
+                        (entry_type == VFS_DIRENT_DIRECTORY &&
+                         target_mode == VFS_MODE_DIRECTORY) ||
+                        (entry_type == VFS_DIRENT_REGULAR &&
+                         target_mode == VFS_MODE_REGULAR);
+                    if (!type_matches) {
+                        report_failure(output, errors,
+                            "A directory entry type does not match its target inode.");
+                    }
+                }
+
+                for (uint32_t i = 0U; i < name_length; i++) {
+                    if (entry[8U + i] == 0U || entry[8U + i] == (uint8_t)'/') {
+                        report_failure(output, errors,
+                            "A directory entry contains an invalid filename byte.");
+                        break;
+                    }
+                }
+            }
+
+            offset += record_length;
+        }
+    }
+
+    (void)directory_inode_number;
 }
 
 int vfs_check(vfs_disk_t *disk, FILE *output)
@@ -255,8 +361,17 @@ int vfs_check(vfs_disk_t *disk, FILE *output)
         }
 
         if (type == VFS_MODE_DIRECTORY) {
-            if (inode.indirect_block != 0U) {
-                /* Already reported above; do not interpret directory pointers. */
+            if (inode.indirect_block == 0U &&
+                required_blocks <= VFS_INODE_DIRECT_BLOCKS) {
+                check_directory_entries(
+                    disk,
+                    inode_number,
+                    &inode,
+                    block_bitmap,
+                    inode_bitmap,
+                    output,
+                    &errors
+                );
             }
             continue;
         }
